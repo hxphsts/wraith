@@ -102,8 +102,9 @@ pub async fn run(identity: Arc<Identity>, mut config: Config, listen: SocketAddr
     // The clipboard follows the cursor. Its backend is single-thread-affine like
     // the injector's, so it too runs on its own thread; its absence is not fatal,
     // a machine with none still shares input. The cache is the current local
-    // clipboard, read at a crossing and written by the thread as it changes.
-    let clip_cache: Cache = Arc::new(Mutex::new(None));
+    // clipboard and what each peer has already been given, written by the thread
+    // as the clipboard changes and read at a crossing.
+    let clip_cache = Cache::default();
     let clipboard = start_clipboard(&clip_cache);
 
     let clock = Clock::start();
@@ -125,7 +126,7 @@ pub async fn run(identity: Arc<Identity>, mut config: Config, listen: SocketAddr
         outgoing: outgoing.clone(),
         hello,
         clipboard: clipboard.clone(),
-        clip_cache: Arc::clone(&clip_cache),
+        clip_cache: clip_cache.clone(),
     };
     let network = start_network(&identity, peers, listen, &local_name, feed)?;
 
@@ -184,7 +185,7 @@ fn start_clipboard(cache: &Cache) -> Option<clipboard::Clipboard> {
     };
 
     let (changed, changes) = std::sync::mpsc::channel();
-    clipboard::spawn_watch(Arc::clone(cache), changes);
+    clipboard::spawn_watch(cache.clone(), changes);
 
     match clipboard::Clipboard::start(backend, changed) {
         Ok(handle) => Some(handle),
@@ -459,9 +460,10 @@ fn apply(command: Command, effects: &Effects<'_>, seq: &mut Seq, now_ms: Millis)
         Command::SendSnapshot { peer, held } => outgoing.send(peer, &Control::Snapshot { held }),
         Command::SendEnter { peer, crossing } => {
             // The cursor is leaving toward this peer, so hand it this machine's
-            // clipboard on the way. Non-blocking: encode and queue, like Enter.
+            // clipboard on the way, but only when there is a copy this peer has
+            // not already been given. Non-blocking: encode and queue, like Enter.
             outgoing.send(peer, &Control::Enter { crossing });
-            if let Some(clipboard) = clipboard_to_send(clip_cache) {
+            if let Some(clipboard) = clipboard_to_send(clip_cache, peer) {
                 outgoing.send(peer, &clipboard);
             }
         }
@@ -1607,7 +1609,7 @@ async fn serve_peer(
         events.clone(),
         clipboard,
         outgoing.clone(),
-        clip_cache,
+        clip_cache.clone(),
     );
     let datagrams = read_datagrams(peer, connection.clone(), events.clone());
 
@@ -1620,6 +1622,11 @@ async fn serve_peer(
     // Whatever ended it, the session must hear about it. This is what turns a
     // dropped connection into a released key rather than a stuck one.
     outgoing.remove(peer);
+    // What this peer had already been given dies with the link. Keeping it would
+    // grow the map by one entry per machine ever linked, and would withhold the
+    // clipboard from that same machine when it comes back on a fresh connection
+    // that may have missed the frame.
+    clip_cache.forget(peer);
     let _ = events.send(Input::PeerLost { peer }).await;
 
     tracing::debug!(%peer, "the peer link ended");
@@ -1672,7 +1679,7 @@ async fn read_control(
         // rather than turned into an `Input`. Handled before `to_input`, which
         // is why that function's `Clipboard` arm is never reached.
         if let Control::Clipboard { mime, bytes } = message {
-            receive_clipboard(peer, mime, bytes, clipboard.as_ref());
+            receive_clipboard(peer, mime, bytes, clipboard.as_ref(), &clip_cache);
             continue;
         }
 
@@ -1685,7 +1692,7 @@ async fn read_control(
         match &message {
             Control::Enter { .. } => had_cursor = true,
             Control::Leave => {
-                if let Some(clip) = clipboard_for_reclaim(had_cursor, &clip_cache) {
+                if let Some(clip) = clipboard_for_reclaim(had_cursor, &clip_cache, peer) {
                     tracing::debug!(%peer, "handing the clipboard to the peer taking the cursor");
                     outgoing.send(peer, &clip);
                 }
@@ -1712,11 +1719,21 @@ fn receive_clipboard(
     mime: String,
     bytes: Vec<u8>,
     clipboard: Option<&clipboard::Clipboard>,
+    cache: &Cache,
 ) {
     let Some(contents) = clipboard_to_set(mime, bytes) else {
         tracing::debug!(%peer, "ignoring a clipboard type this version does not handle");
         return;
     };
+
+    // Recorded before it is offered locally, and recorded even where there is no
+    // backend to offer it on. Before, because the backend echoes an offer back as
+    // a local change and the cache has to already know those bytes to recognise
+    // the echo. Even without a backend, because a machine the cursor merely
+    // passes through still has to carry the clipboard onward to a third machine,
+    // and still has to not hand it back to this peer.
+    cache.adopt_from(peer, contents.clone());
+
     if let Some(clipboard) = clipboard {
         clipboard.set(contents);
     }
@@ -1727,19 +1744,21 @@ fn receive_clipboard(
 /// bytes. Comfortably more than any of those need.
 const CLIPBOARD_FRAMING_MARGIN: usize = 256;
 
-/// The clipboard to hand a peer the cursor is crossing to, if there is one.
+/// The clipboard to hand a peer the cursor is crossing to, if it has not already
+/// been given it.
 ///
 /// Read at the crossing rather than pushed on every copy: the machine losing the
-/// cursor hands its current clipboard to the machine gaining it, which is the
-/// whole of the behaviour. `None` when nothing has been copied yet, or when the
-/// copy is too large to cross.
-fn clipboard_to_send(cache: &Cache) -> Option<Control> {
-    let contents = cache.lock().ok()?.clone()?;
+/// cursor hands its clipboard to the machine gaining it. `None` when nothing has
+/// been copied yet, when this peer already has the current copy, or when the copy
+/// is too large to cross.
+fn clipboard_to_send(cache: &Cache, peer: PeerId) -> Option<Control> {
+    let (generation, contents) = cache.pending_for(peer)?;
 
     // Dropped here, with a clear line, rather than silently at encode time. A
     // copy larger than a frame cannot cross until the transport learns to chunk;
-    // until then it stays put, and the frame it would have overflowed carries the
-    // crossing's other messages intact.
+    // until then it stays put, the peer is deliberately left unsettled so the
+    // same copy is offered again once chunking lands, and the frame it would have
+    // overflowed carries the crossing's other messages intact.
     if contents.bytes.len() > wire::FRAME_BYTES_MAX.saturating_sub(CLIPBOARD_FRAMING_MARGIN) {
         tracing::debug!(
             bytes = contents.bytes.len(),
@@ -1747,6 +1766,12 @@ fn clipboard_to_send(cache: &Cache) -> Option<Control> {
         );
         return None;
     }
+
+    // Settled as the frame is built, because `Outgoing::send` is fire and forget
+    // and has no success to wait for. A link that dies loses the frame, but dying
+    // also ends the reader, which forgets the peer, so the copy is offered again
+    // on the next link.
+    cache.settle(peer, generation);
 
     Some(Control::Clipboard {
         mime: contents.mime,
@@ -1756,11 +1781,13 @@ fn clipboard_to_send(cache: &Cache) -> Option<Control> {
 
 /// The clipboard to hand a peer reclaiming the cursor, if we held it for them.
 ///
-/// The guard is `had_cursor`: the arrival broadcast sends `Leave` to every peer,
-/// but only the one that actually took the cursor should be answered. Without it,
-/// idle peers would each overwrite the reclaiming machine's clipboard.
-fn clipboard_for_reclaim(had_cursor: bool, cache: &Cache) -> Option<Control> {
-    had_cursor.then(|| clipboard_to_send(cache)).flatten()
+/// The first guard is `had_cursor`: the arrival broadcast sends `Leave` to every
+/// peer, but only the one that actually took the cursor should be answered.
+/// Without it, idle peers would each overwrite the reclaiming machine's
+/// clipboard. The second is the generation, which is what keeps the peer from
+/// being handed a copy it already has, including the one it just gave us.
+fn clipboard_for_reclaim(had_cursor: bool, cache: &Cache, peer: PeerId) -> Option<Control> {
+    had_cursor.then(|| clipboard_to_send(cache, peer)).flatten()
 }
 
 /// An inbound clipboard frame as contents to offer, or nothing if unhandled.
@@ -2374,15 +2401,16 @@ mod tests {
     fn nothing_copied_yet_hands_over_nothing() {
         // The honest empty state: a machine that has copied nothing this session
         // sends no clipboard when the cursor leaves it.
-        let cache: Cache = Arc::new(Mutex::new(None));
-        assert!(clipboard_to_send(&cache).is_none());
+        let cache = Cache::default();
+        assert!(clipboard_to_send(&cache, PeerId([1; 32])).is_none());
     }
 
     #[test]
     fn a_crossing_hands_over_the_cached_clipboard() {
-        let cache: Cache = Arc::new(Mutex::new(Some(ClipboardContents::text("copied"))));
+        let cache = Cache::default();
+        cache.observe_local(ClipboardContents::text("copied"));
 
-        match clipboard_to_send(&cache) {
+        match clipboard_to_send(&cache, PeerId([1; 32])) {
             Some(Control::Clipboard { mime, bytes }) => {
                 assert_eq!(mime, crate::ports::MIME_TEXT);
                 assert_eq!(bytes, b"copied");
@@ -2404,9 +2432,10 @@ mod tests {
     fn the_peer_reclaiming_the_cursor_is_handed_the_clipboard() {
         // The return direction: the peer took the cursor and now gives it back,
         // so we hand our clipboard over as it leaves.
-        let cache: Cache = Arc::new(Mutex::new(Some(ClipboardContents::text("from here"))));
+        let cache = Cache::default();
+        cache.observe_local(ClipboardContents::text("from here"));
 
-        match clipboard_for_reclaim(true, &cache) {
+        match clipboard_for_reclaim(true, &cache, PeerId([1; 32])) {
             Some(Control::Clipboard { bytes, .. }) => assert_eq!(bytes, b"from here"),
             other => panic!("expected a clipboard frame, got {other:?}"),
         }
@@ -2417,8 +2446,9 @@ mod tests {
         // The arrival broadcast sends Leave to every peer. Only the one that took
         // the cursor answers; an idle peer must not overwrite the reclaiming
         // machine's clipboard with its own.
-        let cache: Cache = Arc::new(Mutex::new(Some(ClipboardContents::text("stale"))));
-        assert!(clipboard_for_reclaim(false, &cache).is_none());
+        let cache = Cache::default();
+        cache.observe_local(ClipboardContents::text("stale"));
+        assert!(clipboard_for_reclaim(false, &cache, PeerId([1; 32])).is_none());
     }
 
     #[test]
@@ -2426,11 +2456,18 @@ mod tests {
         // A copy too big for a frame cannot cross until chunking lands. It is
         // left in place here so the crossing's other messages still encode,
         // rather than being dropped at send time with a misleading log.
-        let cache: Cache = Arc::new(Mutex::new(Some(ClipboardContents {
+        let peer = PeerId([1; 32]);
+        let cache = Cache::default();
+        cache.observe_local(ClipboardContents {
             mime: crate::ports::MIME_TEXT.to_owned(),
             bytes: vec![b'x'; wire::FRAME_BYTES_MAX],
-        })));
-        assert!(clipboard_to_send(&cache).is_none());
+        });
+
+        assert!(clipboard_to_send(&cache, peer).is_none());
+        assert!(
+            cache.pending_for(peer).is_some(),
+            "refusing to send must not mark the peer as having it"
+        );
     }
 
     #[test]
@@ -2447,6 +2484,7 @@ mod tests {
             crate::ports::MIME_TEXT.to_owned(),
             b"from a peer".to_vec(),
             Some(&handle),
+            &Cache::default(),
         );
 
         for _ in 0..50 {
@@ -2461,5 +2499,89 @@ mod tests {
             Some(b"from a peer".to_vec()),
             "the peer's clipboard never reached the backend"
         );
+    }
+
+    /// An inbound text clipboard from `peer`, with no local backend to offer it
+    /// on. The cache is what these tests are about, and a backend would only add
+    /// a thread and a sleep to each one.
+    fn arrives_from(cache: &Cache, peer: PeerId, text: &str) {
+        receive_clipboard(
+            peer,
+            crate::ports::MIME_TEXT.to_owned(),
+            text.as_bytes().to_vec(),
+            None,
+            cache,
+        );
+    }
+
+    #[test]
+    fn a_peer_is_not_handed_back_the_clipboard_it_just_gave_us() {
+        // The reported bug. Copy on the Mac, cross to this machine, cross back
+        // with nothing copied here: the Mac must keep the copy it just made.
+        let mac = PeerId([1; 32]);
+        let cache = Cache::default();
+        arrives_from(&cache, mac, "copied on the mac");
+
+        assert!(clipboard_for_reclaim(true, &cache, mac).is_none());
+    }
+
+    #[test]
+    fn a_clipboard_from_one_peer_still_crosses_to_a_third_machine() {
+        let cache = Cache::default();
+        arrives_from(&cache, PeerId([1; 32]), "copied on the mac");
+
+        match clipboard_to_send(&cache, PeerId([2; 32])) {
+            Some(Control::Clipboard { bytes, .. }) => assert_eq!(bytes, b"copied on the mac"),
+            other => panic!("expected a clipboard frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_handed_over_clipboard_is_not_handed_over_twice() {
+        let peer = PeerId([1; 32]);
+        let cache = Cache::default();
+        cache.observe_local(ClipboardContents::text("copied"));
+
+        assert!(clipboard_to_send(&cache, peer).is_some());
+        assert!(clipboard_to_send(&cache, peer).is_none());
+    }
+
+    #[test]
+    fn a_copy_made_after_a_handover_crosses_again() {
+        let peer = PeerId([1; 32]);
+        let cache = Cache::default();
+        cache.observe_local(ClipboardContents::text("first"));
+        assert!(clipboard_to_send(&cache, peer).is_some());
+
+        cache.observe_local(ClipboardContents::text("second"));
+
+        match clipboard_to_send(&cache, peer) {
+            Some(Control::Clipboard { bytes, .. }) => assert_eq!(bytes, b"second"),
+            other => panic!("expected a clipboard frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_peer_that_reconnects_is_handed_the_clipboard_again() {
+        // What `serve_peer` promises when a link ends: the frame may have died
+        // with it, so the machine that comes back is offered the copy once more.
+        let peer = PeerId([1; 32]);
+        let cache = Cache::default();
+        cache.observe_local(ClipboardContents::text("copied"));
+        assert!(clipboard_to_send(&cache, peer).is_some());
+
+        cache.forget(peer);
+
+        assert!(clipboard_to_send(&cache, peer).is_some());
+    }
+
+    #[test]
+    fn an_inbound_clipboard_is_recorded_even_with_no_backend() {
+        // A machine the cursor passes through carries the clipboard onward, even
+        // where there is nothing local to offer it on.
+        let cache = Cache::default();
+        arrives_from(&cache, PeerId([1; 32]), "passing through");
+
+        assert!(clipboard_to_send(&cache, PeerId([2; 32])).is_some());
     }
 }

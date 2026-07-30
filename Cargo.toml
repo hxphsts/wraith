@@ -140,7 +140,7 @@ doc_markdown = "allow"
 resolver = "3"
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.90"
 license = "AGPL-3.0-only"
